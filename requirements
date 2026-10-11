@@ -1,1 +1,8 @@
-
+Flask
+gunicorn
+requests
+numpy
+pandas
+scikit-learn
+joblib
+APScheduler
