@@ -18,11 +18,6 @@ from sklearn.pipeline import Pipeline
 from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
-try:
-    current_ip = requests.get("https://api.ipify.org").text.strip()
-    print(f"===> RENDER OUTGOING IP: {current_ip}")
-except Exception as e:
-    print(f"Could not fetch IP: {e}")
 
 # =========================================================
 # CONFIGURATION (LIVE SCALPING MODE)
@@ -771,4 +766,4 @@ if os.environ.get("ENABLE_BACKGROUND_JOBS", "false").lower() == "true":
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-        
+                                        
