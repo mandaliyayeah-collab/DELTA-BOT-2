@@ -25,7 +25,7 @@ except Exception as e:
     print(f"Could not fetch IP: {e}")
 
 # =========================================================
-# CONFIGURATION
+# CONFIGURATION (LIVE SCALPING MODE)
 # =========================================================
 BASE_URL = os.environ.get(
     "DELTA_BASE_URL", "https://api.india.delta.exchange"
@@ -39,13 +39,9 @@ PAIRS = {
 }
 
 MEMORY_FILE = os.environ.get("MEMORY_FILE", "trade_memory.json")
-# Live orders require BOTH DRY_RUN=false and ENABLE_LIVE_TRADING=YES.
-DRY_RUN = os.environ.get("DRY_RUN", "true").lower() != "false"
-ENABLE_LIVE_TRADING = os.environ.get("ENABLE_LIVE_TRADING", "").strip().upper() == "YES"
 BOT_TRIGGER_TOKEN = os.environ.get("BOT_TRIGGER_TOKEN", "")
 MAX_BUDGET_INR = float(os.environ.get("MAX_BUDGET_INR", "1000"))
-MARGIN_ALLOCATION_PERCENT = float(os.environ.get("MARGIN_ALLOCATION_PERCENT", "0.05"))
-CONFIDENCE_BASE_THRESHOLD = 0.60
+CONFIDENCE_BASE_THRESHOLD = 0.65
 MAX_LEVERAGE = 3
 
 FEATURES = [
@@ -88,12 +84,14 @@ def get_headers(method, path, query="", payload=""):
 
 
 # =========================================================
-# MEMORY
+# MEMORY MANAGEMENT
 # =========================================================
 def default_memory():
     return {
         "loss_penalty": 0.0,
         "total_trades": 0,
+        "daily_trade_count": 0,
+        "last_trade_date": "",
         "losses": 0,
         "wins": 0,
         "open_position": None,
@@ -126,10 +124,9 @@ def save_memory(data):
 
 
 # =========================================================
-# PRODUCT SPECS
+# PRODUCT SPECS & BALANCES
 # =========================================================
 def get_product_specs(symbol):
-    """Fetch live product metadata. Never guess product IDs or contract values."""
     url = f"{BASE_URL}/v2/products/{symbol}"
     response = requests.get(url, timeout=10, headers={"Accept": "application/json"})
     response.raise_for_status()
@@ -157,12 +154,7 @@ def round_to_tick(price, tick_size):
     return round(round(float(price) / tick_size) * tick_size, 8)
 
 
-# =========================================================
-# WALLET / POSITIONS
-# =========================================================
 def get_available_balance():
-    if DRY_RUN:
-        return MAX_BUDGET_INR
     try:
         path = "/v2/wallet/balances"
         response = requests.get(BASE_URL + path, headers=get_headers("GET", path), timeout=10)
@@ -172,18 +164,14 @@ def get_available_balance():
             print(f"[BALANCE API ERROR] {data}")
             return 0.0
 
-        print(f"[RAW WALLET DATA] {data.get('result', [])}")
-
         for item in data.get("result", []):
             bal = float(item.get("available_balance") or item.get("balance") or 0.0)
             if bal > 0:
                 symbol = str(item.get("asset_symbol", "")).upper()
-                # Jo Delta USD/USDT value aape (jem ke 11.78), to INR ma badlo
                 if symbol in ["USD", "USDT"] or bal < 100.0:
                     return bal * 85.0
                 return bal
 
-        print("[BALANCE] No active balance found in wallet.")
         return 0.0
     except Exception as exc:
         print(f"[BALANCE ERROR] {exc}")
@@ -191,8 +179,6 @@ def get_available_balance():
 
 
 def get_live_position():
-    if DRY_RUN:
-        return load_memory().get("open_position")
     try:
         path = "/v2/positions/margined"
         response = requests.get(
@@ -212,34 +198,13 @@ def get_live_position():
         return None
 
 
-def cancel_all_open_orders(product_id=None):
-    if DRY_RUN:
-        return
-    try:
-        product_ids = (
-            [product_id]
-            if product_id is not None
-            else [get_product_specs(symbol)["product_id"] for symbol in PAIRS]
-        )
-        for pid in product_ids:
-            path = "/v2/orders/all"
-            payload = json.dumps({"product_id": pid}, separators=(",", ":"))
-            headers = get_headers("DELETE", path, payload=payload)
-            response = requests.delete(
-                BASE_URL + path, headers=headers, data=payload, timeout=10
-            )
-            print(f"[ORDER CLEANUP] product_id={pid}, HTTP={response.status_code}")
-    except Exception as exc:
-        print(f"[CANCEL ALL ERROR] {exc}")
-
-
 # =========================================================
-# MARKET DATA
+# MARKET DATA (1-MINUTE SCALPING RESOLUTION)
 # =========================================================
-def fetch_market_data(symbol, limit_candles=1500):
+def fetch_market_data(symbol, limit_candles=300):
     try:
         now = int(time.time())
-        start_time = now - limit_candles * 15 * 60
+        start_time = now - limit_candles * 60
         base_urls = list(dict.fromkeys([
             BASE_URL,
             "https://api.india.delta.exchange",
@@ -250,7 +215,7 @@ def fetch_market_data(symbol, limit_candles=1500):
         for base in base_urls:
             url = f"{base}/v2/history/candles"
             params = {
-                "resolution": "15m",
+                "resolution": "1m",
                 "symbol": symbol,
                 "start": start_time,
                 "end": now,
@@ -275,7 +240,6 @@ def fetch_market_data(symbol, limit_candles=1500):
                 print(f"[API ATTEMPT ERROR {symbol}] {exc}")
 
         if not candles:
-            print(f"[FETCH ERROR {symbol}] No candle data returned.")
             return None
 
         df = pd.DataFrame(candles).rename(
@@ -284,7 +248,6 @@ def fetch_market_data(symbol, limit_candles=1500):
         required = ["open", "high", "low", "close", "volume"]
         for column in required:
             if column not in df.columns:
-                print(f"[FETCH ERROR {symbol}] Missing column: {column}")
                 return None
             df[column] = pd.to_numeric(df[column], errors="coerce")
 
@@ -404,36 +367,34 @@ def check_institutional_sweep(df, symbol):
     if (
         latest["low"] < latest["recent_low"]
         and latest["close"] > latest["recent_low"]
-        and obi_ratio > 0.35
-        and latest["lower_wick_ratio"] >= 0.40
+        and obi_ratio > 0.30
+        and latest["lower_wick_ratio"] >= 0.35
         and latest["vol_surge"] >= 1.20
         and funding_rate < 0.04
     ):
-                # BUY Logic: મિનિમમ 1% ($25+) નો મોટો ટાર્ગેટ અને 1:2.5 Risk-Reward
-        risk_dist = max(latest["close"] * 0.006, abs(latest["close"] - latest["low"]))
-        sl = round_to_tick(latest["close"] - risk_dist)
-        tp = round_to_tick(latest["close"] + (risk_dist * 2.5))
-        return ("BUY", 0.92, sl, tp, "INSTITUTIONAL_SWEEP")
+        risk_dist = max(latest["close"] * 0.002, abs(latest["close"] - latest["low"]))
+        sl = round_to_tick(latest["close"] - risk_dist, tick_size)
+        tp = round_to_tick(latest["close"] + (risk_dist * 2.0), tick_size)
+        return ("BUY", 0.90, sl, tp, "SCALP_SWEEP")
 
     if (
         latest["high"] > latest["recent_high"]
         and latest["close"] < latest["recent_high"]
-        and obi_ratio < -0.35
+        and obi_ratio < -0.30
         and latest["upper_wick_ratio"] >= 0.30
         and latest["vol_surge"] >= 1.20
         and funding_rate > -0.04
     ):
-        # SELL Logic: મિનિમમ 1% ($25+) નો મોટો ટાર્ગેટ અને 1:2.5 Risk-Reward
-        risk_dist = max(latest["close"] * 0.006, abs(latest["high"] - latest["close"]))
-        sl = round_to_tick(latest["close"] + risk_dist)
-        tp = round_to_tick(latest["close"] - (risk_dist * 2.5))
-        return ("SELL", 0.92, sl, tp, "INSTITUTIONAL_SWEEP")
+        risk_dist = max(latest["close"] * 0.002, abs(latest["high"] - latest["close"]))
+        sl = round_to_tick(latest["close"] + risk_dist, tick_size)
+        tp = round_to_tick(latest["close"] - (risk_dist * 2.0), tick_size)
+        return ("SELL", 0.90, sl, tp, "SCALP_SWEEP")
         
     return None
 
 
 # =========================================================
-# AI TRAINING
+# AI TRAINING & MODEL LOADING
 # =========================================================
 def build_ai_pipeline():
     return Pipeline([
@@ -450,32 +411,25 @@ def build_ai_pipeline():
 
 def train_and_save_ai_brain_for_pair(symbol, model_file):
     if not training_lock.acquire(blocking=False):
-        print(f"[AI] Training already running; skipping {symbol}.")
         return None
     try:
-        print(f"[{datetime.now()}] [AI] Training started for {symbol}")
-        df = fetch_market_data(symbol, limit_candles=1500)
+        df = fetch_market_data(symbol, limit_candles=1000)
         if df is None or len(df) < 150:
-            print(f"[AI] Not enough candle data for {symbol}.")
             return None
 
         df = add_indicators(df)
         clean = df.dropna(subset=FEATURES + ["target"]).copy()
         if len(clean) < 80:
-            print(f"[AI] Not enough clean training rows for {symbol}.")
             return None
 
-        # Last row has no known future outcome; exclude it from training.
         X = clean[FEATURES].iloc[:-1]
         y = clean["target"].iloc[:-1]
         if y.nunique() < 2:
-            print(f"[AI] Training labels contain only one class for {symbol}.")
             return None
 
         pipeline = build_ai_pipeline()
         pipeline.fit(X, y)
         joblib.dump(pipeline, model_file)
-        print(f"[AI] Saved {model_file}; samples={len(X)}")
         return pipeline
     except Exception as exc:
         print(f"[AI TRAIN ERROR {symbol}] {exc}")
@@ -494,81 +448,39 @@ def get_or_load_ai_brain(symbol):
     if os.path.exists(model_file):
         try:
             return joblib.load(model_file)
-        except Exception as exc:
-            print(f"[AI LOAD ERROR {symbol}] {exc}")
+        except Exception:
+            pass
     return train_and_save_ai_brain_for_pair(symbol, model_file)
-
-
-# =========================================================
-# RISK MANAGEMENT
-# =========================================================
-def update_dynamic_risk_management(current_price):
-    active_position = get_live_position()
-    memory = load_memory()
-    position = memory.get("open_position")
-
-    if not active_position and position is not None and not DRY_RUN:
-        print("[RISK CONTROL] Live position closed; clearing memory.")
-        cancel_all_open_orders()
-        memory["open_position"] = None
-        save_memory(memory)
-        return
-
-    if not position:
-        return
-
-    side = position.get("side")
-    entry = float(position.get("entry", 0) or 0)
-    stop_loss = float(position.get("sl", 0) or 0)
-    risk_unit = abs(entry - stop_loss)
-    if entry <= 0 or risk_unit <= 0:
-        return
-
-    if side == "BUY" and current_price >= entry + 1.5 * risk_unit and stop_loss < entry:
-        position["sl"] = entry
-        print(f"[RISK CONTROL] BUY break-even SL={entry}")
-    elif side == "SELL" and current_price <= entry - 1.5 * risk_unit and stop_loss > entry:
-        position["sl"] = entry
-        print(f"[RISK CONTROL] SELL break-even SL={entry}")
-
-    memory["open_position"] = position
-    save_memory(memory)
     # =========================================================
 # POSITION SIZING
 # =========================================================
 def calculate_contracts(symbol, balance, leverage, entry_price):
-    """Safe sizing calculation strictly bounded by available USD margin."""
     try:
         specs = get_product_specs(symbol)
         contract_value = float(specs.get("contract_value") or 0.0)
         if balance <= 0 or entry_price <= 0 or contract_value <= 0:
             return 0
 
-        # Balance જો INR માં હોય (100 થી વધુ), તો તેને USD માં કન્વર્ટ કરો
         balance_usd = (balance / 85.0) if balance > 100.0 else balance
+        usable_margin = balance_usd * 0.90
+        eff_leverage = max(1, min(int(leverage or 3), int(MAX_LEVERAGE)))
         
-        # સુરક્ષિત માર્જિન: વૉલેટના વધુમાં વધુ 70% માર્જિનનો ઉપયોગ કરવો
-        usable_margin = balance_usd * 0.70
-        eff_leverage = max(1, min(int(leverage or 5), int(MAX_LEVERAGE)))
-        
-        # 1 કોન્ટ્રાક્ટ માટે જરૂરી USD માર્જિન
         margin_per_contract = (entry_price * contract_value) / eff_leverage
         if margin_per_contract <= 0:
             return 0
 
         qty = int(usable_margin / margin_per_contract)
-        
-        # જો માર્જિન પૂરતું હોય તો ઓછામાં ઓછો 1 કોન્ટ્રાક્ટ પ્લેસ કરો
-        if qty == 0 and usable_margin >= margin_per_contract * 0.85:
+        if qty == 0 and usable_margin >= margin_per_contract * 0.70:
             qty = 1
 
-        print(f"[SIZING] {symbol} => Available USD: {balance_usd:.2f}, Margin/Contract: {margin_per_contract:.2f}, Final Qty: {qty}")
         return max(0, qty)
     except Exception as exc:
         print(f"[SIZING ERROR {symbol}] {exc}")
         return 0
-        # =========================================================
-# PREDICTION ENGINE
+
+
+# =========================================================
+# PREDICTION ENGINE (SCALPING LOGIC)
 # =========================================================
 def predict_signal(symbol, df):
     if df is None or len(df) < 30:
@@ -579,17 +491,16 @@ def predict_signal(symbol, df):
     if len(clean) < 20:
         return ("HOLD", 0.0, 0.0, 0.0, 0, "INSUFFICIENT_FEATURE_DATA")
 
-    # Use the last completed candle, not the potentially still-forming candle.
     candle = clean.iloc[-2]
     chop = float(candle["chop_index"])
     adx = float(candle["adx"])
     if chop > 61.8 and adx < 20:
-        return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY_NO_TREND")
+        return ("HOLD", 0.0, 0.0, 0.0, 0, "REGIME_FILTER_CHOPPY")
 
     institutional_signal = check_institutional_sweep(clean.iloc[:-1], symbol)
     if institutional_signal:
         action, confidence, sl, tp, tag = institutional_signal
-        return (action, confidence, sl, tp, 4, tag)
+        return (action, confidence, sl, tp, 3, tag)
 
     pipeline = get_or_load_ai_brain(symbol)
     if pipeline is None:
@@ -598,30 +509,16 @@ def predict_signal(symbol, df):
     try:
         features = clean[FEATURES].iloc[[-2]]
         probabilities = pipeline.predict_proba(features)[0]
-        classes = pipeline.named_steps["model"].classes_
     except Exception as exc:
         print(f"[PREDICTION ERROR {symbol}] {exc}")
         return ("HOLD", 0.0, 0.0, 0.0, 0, "PREDICTION_ERROR")
 
-    prob_up, prob_down = 0.0, 0.0
-    for class_label, probability in zip(classes, probabilities):
-        if int(class_label) == 1:
-            prob_up = float(probability)
-        else:
-            prob_down = float(probability)
-
+    prob_up, prob_down = float(probabilities[1]), float(probabilities[0])
     atr = float(candle["atr"])
     close = float(candle["close"])
-    norm_atr = atr / (close + 1e-9)
-
-    dynamic_confidence = CONFIDENCE_BASE_THRESHOLD
-    if norm_atr > 0.008:
-        dynamic_confidence = 0.68
-    elif norm_atr > 0.005:
-        dynamic_confidence = 0.64
 
     memory = load_memory()
-    threshold = min(0.90, dynamic_confidence + float(memory.get("loss_penalty", 0.0)))
+    threshold = min(0.85, CONFIDENCE_BASE_THRESHOLD + float(memory.get("loss_penalty", 0.0)))
     funding_rate = fetch_funding_rate(symbol)
 
     if prob_up >= threshold and funding_rate < 0.035:
@@ -629,22 +526,15 @@ def predict_signal(symbol, df):
     elif prob_down >= threshold and funding_rate > -0.035:
         action, confidence = "SELL", prob_down
     else:
-        return (
-            "HOLD", max(prob_up, prob_down), 0.0, 0.0, 0,
-            f"AI_WAIT (REQ:{threshold:.2f})"
-        )
+        return ("HOLD", max(prob_up, prob_down), 0.0, 0.0, 0, f"AI_WAIT (REQ:{threshold:.2f})")
 
-    leverage = 5 if confidence >= 0.78 else (
-        4 if confidence >= 0.68 else (
-            3 if confidence >= 0.60 else 2
-        )
-    )
-    leverage = min(leverage, MAX_LEVERAGE)
-
+    leverage = MAX_LEVERAGE
     tick_size = get_product_specs(symbol)["tick_size"]
-    sl_distance = atr * 1.2
-    tp_distance = atr * 2.8
-
+    
+    # Scalping targets
+    sl_distance = atr * 0.75
+    tp_distance = atr * 1.50
+    
     if action == "BUY":
         sl = round_to_tick(close - sl_distance, tick_size)
         tp = round_to_tick(close + tp_distance, tick_size)
@@ -652,61 +542,77 @@ def predict_signal(symbol, df):
         sl = round_to_tick(close + sl_distance, tick_size)
         tp = round_to_tick(close - tp_distance, tick_size)
 
+    # Fee buffer filter
+    if abs(tp - close) / close < 0.0020:
+        return ("HOLD", 0.0, 0.0, 0.0, 0, "SKIPPED_TARGET_TOO_SMALL_FOR_FEES")
+
     return (
         action, confidence, sl, tp, leverage,
-        f"AI_BRAIN_{symbol} (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})"
+        f"SCALP_AI_{symbol} (UP:{prob_up:.2f}, DOWN:{prob_down:.2f})"
     )
 
 
 # =========================================================
-# ORDER EXECUTION
+# LIVE ORDER PLACEMENT (SERVER-SIDE TRAILING BRACKET)
 # =========================================================
 def place_order_with_brackets(symbol, action, size, stop_loss, take_profit):
-    if DRY_RUN:
-        return {"success": True, "status": "DRY_RUN_SUCCESS", "message": "No real order placed."}
-    if not ENABLE_LIVE_TRADING:
-        return {"success": False, "error": "Live trading blocked. Set ENABLE_LIVE_TRADING=YES explicitly."}
     if size <= 0:
         return {"success": False, "error": "Invalid order size."}
+
     try:
         specs = get_product_specs(symbol)
         if specs["state"] not in ("", "live", "active", "open"):
-                        return {"success": False, "error": "Product not live"}
-        
+            return {"success": False, "error": "Product not live"}
+
         path = "/v2/orders"
-        sl_val = round_to_tick(float(stop_loss))
-        tp_val = round_to_tick(float(take_profit))
+        tick_size = float(specs.get("tick_size", 0.1))
+
+        tp_val = round_to_tick(float(take_profit), tick_size)
+        trail_val = round_to_tick(abs(float(take_profit) - float(stop_loss)) * 0.45, tick_size)
 
         payload = {
             "product_id": specs["product_id"],
             "size": int(size),
             "side": "buy" if action == "BUY" else "sell",
             "order_type": "market_order",
-            "bracket_stop_loss_price": f"{sl_val:.2f}" if specs.get("tick_size", "1") in ["0.01", "0.1", "0.5"] else str(sl_val),
-            "bracket_take_profit_price": f"{tp_val:.2f}" if specs.get("tick_size", "1") in ["0.01", "0.1", "0.5"] else str(tp_val),
-            "bracket_stop_trigger_method": "mark_price"
-             }
-        
-                 
-        
-        
-        
-        
-        
-        
+            "bracket_take_profit_price": str(tp_val),
+            "bracket_stop_trigger_method": "mark_price",
+            "bracket_trail_amount": str(trail_val)
+        }
+
         payload_str = json.dumps(payload, separators=(",", ":"))
         headers = get_headers("POST", path, payload=payload_str)
-        response = requests.post(BASE_URL + path, headers=headers, data=payload_str, timeout=15)
+
+        response = requests.post(
+            BASE_URL + path,
+            headers=headers,
+            data=payload_str,
+            timeout=15
+        )
+
         try:
             result = response.json()
         except ValueError:
-            result = {"success": False, "error": f"Non-JSON response (HTTP {response.status_code})"}
+            result = {
+                "success": False,
+                "error": f"Non-JSON response (HTTP {response.status_code})"
+            }
+
         if response.status_code >= 400 or not result.get("success"):
-            print(f"[ORDER API REJECTED {symbol}] HTTP={response.status_code}, response={result}")
-            return {"success": False, "http_status": response.status_code, "exchange_response": result}
+            print(
+                f"[LIVE ORDER API REJECTED {symbol}] "
+                f"HTTP={response.status_code}, response={result}"
+            )
+            return {
+                "success": False,
+                "http_status": response.status_code,
+                "exchange_response": result
+            }
+
         return result
+
     except Exception as exc:
-        print(f"[ORDER ERROR {symbol}] {exc}")
+        print(f"[LIVE ORDER ERROR {symbol}] {exc}")
         return {"success": False, "error": str(exc)}
 
 
@@ -718,45 +624,38 @@ def place_order_with_brackets(symbol, action, size, stop_loss, take_profit):
 def health_check():
     return jsonify({
         "status": "ok",
-        "service": "Crypto AI Trading Bot",
-        "dry_run": DRY_RUN,
-        "live_trading_enabled": ENABLE_LIVE_TRADING,
-        "max_budget_inr": MAX_BUDGET_INR,
+        "mode": "LIVE_REAL_TRADING",
+        "service": "Crypto Scalping AI Bot",
+        "timeframe": "1m",
         "pairs": list(PAIRS.keys()),
     }), 200
 
 
 @app.route("/execute-trade", methods=["GET"])
 def execute_trade():
-    # Never expose an unauthenticated endpoint that can submit real orders.
     if not BOT_TRIGGER_TOKEN:
-        return jsonify({"status": "TRIGGER_NOT_CONFIGURED", "message": "Set BOT_TRIGGER_TOKEN in environment variables."}), 503
+        return jsonify({"status": "TRIGGER_NOT_CONFIGURED", "message": "Set BOT_TRIGGER_TOKEN."}), 503
     supplied_token = request.headers.get("X-Bot-Token", "")
     if not secrets.compare_digest(supplied_token, BOT_TRIGGER_TOKEN):
         return jsonify({"status": "UNAUTHORIZED"}), 401
 
-    if not DRY_RUN and not ENABLE_LIVE_TRADING:
-        return jsonify({"status": "LIVE_TRADING_DISABLED", "message": "Set DRY_RUN=false and ENABLE_LIVE_TRADING=YES only after verifying account and settings."}), 403
-
     active_position = get_live_position()
-
     if active_position:
         symbol = active_position.get("product_symbol", active_position.get("symbol", "BTCUSD"))
-        market_data = fetch_market_data(symbol, limit_candles=50)
-        latest_price = (
-            float(market_data["close"].iloc[-1])
-            if market_data is not None and not market_data.empty
-            else 0.0
-        )
-        if latest_price > 0:
-            update_dynamic_risk_management(latest_price)
         return jsonify({
             "status": "POSITION_ALREADY_OPEN",
             "active_symbol": symbol,
-            "message": "Existing position found; skipping new orders.",
+            "message": "Live position is open; Delta server-side trailing bracket is active.",
         }), 200
 
     balance = get_available_balance()
+    if balance <= 0:
+        return jsonify({
+            "status": "FAILED_NO_BALANCE",
+            "balance": balance,
+            "message": "Delta wallet ma trading mate balance nathi."
+        }), 200
+
     best_candidate = None
 
     for symbol in PAIRS:
@@ -784,28 +683,17 @@ def execute_trade():
         symbol = best_candidate["symbol"]
         action = best_candidate["action"]
 
-        if balance <= 0 and not DRY_RUN:
-            return jsonify({
-                "status": "FAILED_NO_BALANCE",
-                "symbol": symbol,
-                "balance": balance,
-            }), 200
-
-        if MAX_BUDGET_INR <= 0 or MARGIN_ALLOCATION_PERCENT <= 0 or MARGIN_ALLOCATION_PERCENT > 1:
-            return jsonify({"status": "FAILED_RISK_CONFIG", "message": "Check MAX_BUDGET_INR and MARGIN_ALLOCATION_PERCENT."}), 500
-
         contracts = calculate_contracts(
             symbol, balance, best_candidate["leverage"], best_candidate["latest_close"]
         )
         if contracts <= 0:
-            return jsonify({"status": "SKIPPED_BUDGET_TOO_SMALL", "symbol": symbol, "budget_inr": min(balance, MAX_BUDGET_INR), "message": "One contract does not fit this sizing calculation; no order placed."}), 200
+            return jsonify({"status": "SKIPPED_BUDGET_TOO_SMALL", "symbol": symbol}), 200
 
         order_result = place_order_with_brackets(
             symbol, action, contracts, best_candidate["sl"], best_candidate["tp"]
         )
 
-        # Do not record a live position if the exchange rejected the order.
-        if not DRY_RUN and order_result.get("success") is not True:
+        if order_result.get("success") is not True:
             return jsonify({
                 "status": "ORDER_FAILED",
                 "symbol": symbol,
@@ -826,7 +714,7 @@ def execute_trade():
         save_memory(memory)
 
         return jsonify({
-            "status": "SIMULATED_ORDER" if DRY_RUN else "ORDER_SUBMITTED",
+            "status": "LIVE_ORDER_SUBMITTED",
             "symbol": symbol,
             "action": action,
             "confidence": f"{best_candidate['confidence'] * 100:.2f}%",
@@ -843,16 +731,15 @@ def execute_trade():
         "status": "WAIT_AND_SEE",
         "action": "HOLD",
         "scanned_pairs": list(PAIRS.keys()),
-        "message": "No qualifying signal found.",
+        "message": "No qualifying scalp signal found.",
         "balance": balance,
     }), 200
 
 
 # =========================================================
-# BACKGROUND TASKS / STARTUP
+# BACKGROUND INITIALIZATION
 # =========================================================
 def init_background_training():
-    # Small delay lets the web service finish booting first.
     time.sleep(15)
     for symbol, config in PAIRS.items():
         if not os.path.exists(config["model_file"]):
@@ -874,10 +761,8 @@ def start_scheduler():
         )
     if not scheduler.running:
         scheduler.start()
-        print("[SCHEDULER] Started successfully")
 
 
-# Enable background jobs explicitly; multiple web workers can duplicate schedulers.
 if os.environ.get("ENABLE_BACKGROUND_JOBS", "false").lower() == "true":
     start_scheduler()
     training_thread = threading.Thread(target=init_background_training, name="ai-brain-startup", daemon=True)
@@ -886,5 +771,4 @@ if os.environ.get("ENABLE_BACKGROUND_JOBS", "false").lower() == "true":
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
-
-
+        
