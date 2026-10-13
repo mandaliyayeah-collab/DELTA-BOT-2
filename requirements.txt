@@ -1,3 +1,4 @@
+
 Flask
 gunicorn
 requests
@@ -6,3 +7,6 @@ pandas
 scikit-learn
 joblib
 APScheduler
+python-telegram-bot
+openai
+python-dotenv
