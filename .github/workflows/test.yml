@@ -1,0 +1,28 @@
+
+name: Test AI Coding Agent
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Get repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Python syntax
+        run: python -m py_compile agent.py test_agent.py
+
+      - name: Run syntax tests
+        run: python -m unittest test_agent.py
+        
